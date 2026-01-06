@@ -1,3 +1,6 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <QtWidgets>
 #include <QtCore>
 #include <QFile>
@@ -7,13 +10,19 @@
 #include <QScrollArea>
 #include <QWheelEvent>
 #include <QScrollBar>
+#include <QStandardPaths>
+#include <windows.h>
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <exception>
 #include <csignal>
 #include <thread>
 #include <vector>
 #include <cmath>
+#include <string>
+#include <iostream>
+#include "log_teebuf.h"
 #include "frame_types.h"
 #include "dcam_controller.h"
 #include "frame_grabber.h"
@@ -22,70 +31,156 @@ namespace {
 QMutex gLogMutex;
 QFile gLogFile;
 QString gLogPath;
+void logMessage(const QString& msg);
+void installLogTees();
 
 class ZoomImageView : public QScrollArea {
 public:
     ZoomImageView(QWidget* parent=nullptr)
-        : QScrollArea(parent), label(new QLabel), scale(1.0) {
+        : QScrollArea(parent), label(new QLabel), scale(1.0), hasImage(false), zoomSteps(0), effectiveScale(1.0) {
         label->setBackgroundRole(QPalette::Base);
         label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
-        label->setScaledContents(true);
+        label->setScaledContents(true); // paint-time scaling instead of allocating huge pixmaps
         setWidget(label);
         setAlignment(Qt::AlignCenter);
         setWidgetResizable(false);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        setMouseTracking(true);
     }
+
+    void setZoomChanged(const std::function<void(double)>& cb) { onZoomChanged = cb; }
 
     void setImage(const QImage& img) {
         if (img.isNull()) return;
-        lastImage = img;
+        if (!hasImage) {
+            scale = 1.0;
+            effectiveScale = 1.0;
+            hasImage = true;
+            zoomSteps = 0;
+            if (onZoomChanged) onZoomChanged(effectiveScale);
+            if (horizontalScrollBar()) horizontalScrollBar()->setValue(0);
+            if (verticalScrollBar()) verticalScrollBar()->setValue(0);
+        }
+        // Make a deep copy so the buffer is stable while frames keep streaming.
+        lastImage = img.copy();
+        basePixmap = QPixmap::fromImage(lastImage);
         updatePixmap();
     }
 
     void resetScale() {
         scale = 1.0;
+        effectiveScale = 1.0;
+        zoomSteps = 0;
+        if (onZoomChanged) onZoomChanged(effectiveScale);
+        hasImage = !lastImage.isNull();
         updatePixmap();
     }
 
 protected:
     void wheelEvent(QWheelEvent* ev) override {
-        if (lastImage.isNull()) {
-            QScrollArea::wheelEvent(ev);
-            return;
-        }
-        double numDegrees = ev->angleDelta().y();
-        double factor = std::pow(1.0015, numDegrees);
-        double newScale = std::clamp(scale * factor, 0.02, 20.0);
-        if (qFuzzyCompare(newScale, scale)) {
+        try {
+            if (lastImage.isNull()) {
+                QScrollArea::wheelEvent(ev);
+                return;
+            }
+            // Normalize to wheel ticks (120 per detent)
+            double ticks = ev->angleDelta().y() / 120.0;
+            double oldScale = scale;
+            int newSteps = std::clamp(zoomSteps + static_cast<int>(std::round(ticks)), -50, 50);
+            double desiredScale = std::pow(1.25, newSteps); // ~1.25x per tick
+            double maxScale = computeMaxScale();
+            double newScale = std::clamp(desiredScale, 0.05, maxScale); // avoid zero/negative and clamp max
+            if (qFuzzyCompare(newScale, scale)) {
+                ev->accept();
+                return;
+            }
+            // Keep steps consistent with the clamped scale to avoid runaway values.
+            zoomSteps = static_cast<int>(std::lround(std::log(newScale) / std::log(1.25)));
+
+            QPointF vpPos = ev->position();
+            QPointF contentPos = (vpPos + QPointF(horizontalScrollBar()->value(),
+                                                  verticalScrollBar()->value())) / oldScale;
+
+            scale = newScale;
+            logMessage(QString("Zoom wheel ticks=%1 steps=%2 scale=%3").arg(ticks,0,'f',2).arg(zoomSteps).arg(scale,0,'f',2));
+            logMessage(QString("Zoom before update: vp=(%1,%2) content=(%3,%4)")
+                .arg(vpPos.x(),0,'f',1).arg(vpPos.y(),0,'f',1)
+                .arg(contentPos.x(),0,'f',1).arg(contentPos.y(),0,'f',1));
+
+            updatePixmap();
+
+            horizontalScrollBar()->setValue(int(contentPos.x() * scale - vpPos.x()));
+            verticalScrollBar()->setValue(int(contentPos.y() * scale - vpPos.y()));
+            logMessage(QString("Zoom after update: hVal=%1 vVal=%2").arg(horizontalScrollBar()->value()).arg(verticalScrollBar()->value()));
             ev->accept();
-            return;
+        } catch (const std::exception& e) {
+            logMessage(QString("Zoom wheel exception: %1").arg(e.what()));
+        } catch (...) {
+            logMessage("Zoom wheel exception: unknown");
         }
-
-        QPointF vpPos = ev->position();
-        QPointF contentPos = (vpPos + QPointF(horizontalScrollBar()->value(),
-                                              verticalScrollBar()->value())) / scale;
-
-        scale = newScale;
-        updatePixmap();
-
-        horizontalScrollBar()->setValue(int(contentPos.x() * scale - vpPos.x()));
-        verticalScrollBar()->setValue(int(contentPos.y() * scale - vpPos.y()));
-        ev->accept();
     }
 
 private:
+    double computeMaxScale() const {
+        if (basePixmap.isNull()) return 1.56;
+        int w = basePixmap.width();
+        int h = basePixmap.height();
+        int maxDim = (std::min(w, h) <= 256) ? 8192 : 4096;
+        double dimCap = static_cast<double>(maxDim) / static_cast<double>(std::max(w, h));
+        // Allow more zoom for small dimensions but cap to a sane upper bound.
+        return std::clamp(std::max(1.56, dimCap * 2.0), 0.1, 8.0);
+    }
+
     void updatePixmap() {
-        if (lastImage.isNull()) return;
-        const int w = std::max(1, static_cast<int>(std::lround(lastImage.width() * scale)));
-        const int h = std::max(1, static_cast<int>(std::lround(lastImage.height() * scale)));
-        QSize scaledSize(w, h);
-        QPixmap pm = QPixmap::fromImage(lastImage).scaled(scaledSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        label->setPixmap(pm);
-        label->resize(pm.size());
+        try {
+            if (basePixmap.isNull() || scale <= 0.0) return;
+            if (updatingPixmap.test_and_set()) {
+                // Skip re-entrant calls that can happen when zooming rapidly during streaming.
+                return;
+            }
+            int baseW = basePixmap.width();
+            int baseH = basePixmap.height();
+            QSize targetSize = (scale == 1.0)
+                ? basePixmap.size()
+                : QSize(std::max(1, int(std::lround(baseW * scale))),
+                        std::max(1, int(std::lround(baseH * scale))));
+
+            int maxDim = (std::min(baseW, baseH) <= 256) ? 8192 : 4096;
+            if (targetSize.width() > maxDim || targetSize.height() > maxDim) {
+                double factor = static_cast<double>(maxDim) / static_cast<double>(std::max(targetSize.width(), targetSize.height()));
+                targetSize.setWidth(std::max(1, int(std::lround(targetSize.width() * factor))));
+                targetSize.setHeight(std::max(1, int(std::lround(targetSize.height() * factor))));
+                logMessage(QString("updatePixmap clamped target to %1x%2").arg(targetSize.width()).arg(targetSize.height()));
+            }
+
+            label->setPixmap(basePixmap);
+            label->resize(targetSize);
+            label->setAlignment(Qt::AlignCenter);
+            effectiveScale = static_cast<double>(targetSize.width()) / static_cast<double>(baseW);
+            logMessage(QString("updatePixmap scaled=%1x%2 scaleReq=%3 scaleEff=%4")
+                       .arg(targetSize.width()).arg(targetSize.height())
+                       .arg(scale,0,'f',2).arg(effectiveScale,0,'f',2));
+            if (onZoomChanged) onZoomChanged(effectiveScale);
+            updatingPixmap.clear();
+        } catch (const std::exception& e) {
+            logMessage(QString("updatePixmap exception: %1").arg(e.what()));
+            updatingPixmap.clear();
+        } catch (...) {
+            logMessage("updatePixmap exception: unknown");
+            updatingPixmap.clear();
+        }
     }
 
     QLabel* label;
     QImage lastImage;
+    QPixmap basePixmap;
     double scale;
+    double effectiveScale;
+    bool hasImage;
+    int zoomSteps;
+    std::atomic_flag updatingPixmap = ATOMIC_FLAG_INIT;
+    std::function<void(double)> onZoomChanged;
 };
 
 void pruneLogs() {
@@ -109,10 +204,6 @@ void logMessage(const QString& msg) {
     ts << line << "\n";
     ts.flush();
     gLogFile.close();
-    // mirror to console for visibility when launched from a terminal
-    QTextStream out(stdout);
-    out << line << "\n";
-    out.flush();
     pruneLogs();
 }
 
@@ -133,6 +224,13 @@ void termHandler() {
     logMessage("std::terminate called");
     std::_Exit(1);
 }
+
+void installLogTees() {
+    static LogTeeBuf loggerBuf(std::cout.rdbuf(), [](const QString& m){ logMessage(m); });
+    static std::ostream loggerStream(&loggerBuf);
+    std::cout.rdbuf(loggerStream.rdbuf());
+    std::cerr.rdbuf(loggerStream.rdbuf());
+}
 } // namespace
 
 
@@ -141,9 +239,11 @@ int main(int argc, char *argv[]) {
 
     gLogPath = QCoreApplication::applicationDirPath() + "/session_log.txt";
     gLogFile.setFileName(gLogPath);
+    if (QFile::exists(gLogPath)) QFile::remove(gLogPath);
     pruneLogs();
     qInstallMessageHandler(qtLogHandler);
     std::set_terminate(termHandler);
+    installLogTees();
 
     QWidget window;
     window.setWindowTitle("Hamamatsu Live View");
@@ -165,9 +265,10 @@ int main(int argc, char *argv[]) {
     statsLabel->setTextFormat(Qt::PlainText);
     statsLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     statsLabel->setMinimumWidth(220);
+    auto zoomLabel = new QLabel("Zoom: x1.00");
+    zoomLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
 
     // Buttons
-    auto initBtn = new QPushButton("Init / Open");
     auto startBtn = new QPushButton("Start");
     auto stopBtn = new QPushButton("Stop");
     auto reconnectBtn = new QPushButton("Reconnect");
@@ -213,6 +314,10 @@ int main(int argc, char *argv[]) {
     binCombo->addItems({"1","2","4"});
     binCombo->setCurrentIndex(0);
 
+    auto bitsCombo = new QComboBox;
+    bitsCombo->addItems({"8","12","16"});
+    bitsCombo->setCurrentIndex(0); // default 8-bit
+
     auto binIndCheck = new QCheckBox("Independent binning");
     auto binHSpin = new QSpinBox;
     auto binVSpin = new QSpinBox;
@@ -241,9 +346,11 @@ int main(int argc, char *argv[]) {
         defaultSaveDir = QCoreApplication::applicationDirPath();
     auto savePathEdit = new QLineEdit(defaultSaveDir);
     auto saveBrowseBtn = new QPushButton("...");
+    auto saveOpenBtn = new QPushButton("Open Folder");
     auto saveStartBtn = new QPushButton("Start Save");
     auto saveStopBtn = new QPushButton("Stop Save");
     saveStopBtn->setEnabled(false);
+    auto captureBtn = new QPushButton("Capture Frame");
     auto saveInfoLabel = new QLabel("Elapsed: 0.0 s\nFrames: 0");
     QDialog* savingDialog = nullptr;
     QLabel* savingDialogLabel = nullptr;
@@ -256,6 +363,7 @@ int main(int argc, char *argv[]) {
 
     auto controlLayout = new QVBoxLayout;
     controlLayout->addWidget(statusLabel);
+    controlLayout->addWidget(zoomLabel);
     controlLayout->addWidget(statsLabel);
 
     auto tabFormats = new QWidget;
@@ -275,13 +383,15 @@ int main(int argc, char *argv[]) {
     binHVLayout->addWidget(binHSpin);
     binHVLayout->addWidget(binVSpin);
     grid->addLayout(binHVLayout,4,1);
-    grid->addWidget(new QLabel("Exposure (ms)"),5,0);
-    grid->addWidget(exposureSpin,5,1);
-    grid->addWidget(new QLabel("Readout speed"),6,0);
-    grid->addWidget(readoutCombo,6,1);
-    grid->addWidget(new QLabel("Display every Nth frame"),7,0);
-    grid->addWidget(displayEverySpin,7,1);
-    grid->addWidget(logCheck,8,0,1,2);
+    grid->addWidget(new QLabel("Bits"),5,0);
+    grid->addWidget(bitsCombo,5,1);
+    grid->addWidget(new QLabel("Exposure (ms)"),6,0);
+    grid->addWidget(exposureSpin,6,1);
+    grid->addWidget(new QLabel("Readout speed"),7,0);
+    grid->addWidget(readoutCombo,7,1);
+    grid->addWidget(new QLabel("Display every Nth frame"),8,0);
+    grid->addWidget(displayEverySpin,8,1);
+    grid->addWidget(logCheck,9,0,1,2);
     tabFormats->setLayout(grid);
 
     tabWidget->addTab(tabFormats, "Formats / Speed");
@@ -290,15 +400,16 @@ int main(int argc, char *argv[]) {
     saveLayout->addWidget(new QLabel("Save path"),0,0);
     saveLayout->addWidget(savePathEdit,0,1);
     saveLayout->addWidget(saveBrowseBtn,0,2);
-    saveLayout->addWidget(saveInfoLabel,1,0,1,3);
-    saveLayout->addWidget(saveStartBtn,2,1);
-    saveLayout->addWidget(saveStopBtn,2,2);
+    saveLayout->addWidget(saveOpenBtn,0,3);
+    saveLayout->addWidget(saveInfoLabel,1,0,1,4);
+    saveLayout->addWidget(saveStartBtn,2,2);
+    saveLayout->addWidget(saveStopBtn,2,3);
+    saveLayout->addWidget(captureBtn,3,2,1,2);
     auto saveWidget = new QWidget;
     saveWidget->setLayout(saveLayout);
     tabWidget->addTab(saveWidget, "Save");
 
     auto btnRow = new QHBoxLayout;
-    btnRow->addWidget(initBtn);
     btnRow->addWidget(startBtn);
     btnRow->addWidget(stopBtn);
     btnRow->addWidget(reconnectBtn);
@@ -323,8 +434,14 @@ int main(int argc, char *argv[]) {
         logMessage(msg);
     };
 
+    imageView->setZoomChanged([zoomLabel](double z){
+        zoomLabel->setText(QString("Zoom: x%1").arg(z,0,'f',2));
+    });
+
     DcamController controller(&window);
     FrameGrabber grabber(&controller);
+    QImage lastFrame;
+    FrameMeta lastMeta{};
 
     auto refreshExposureLimits = [&](){
         if (!controller.isOpened()) return;
@@ -356,8 +473,8 @@ int main(int argc, char *argv[]) {
         QSize preset = presetCombo->currentData().toSize();
         bool isCustom = preset.width() < 0 || preset.height() < 0;
         int bin = binCombo->currentText().toInt();
-        int bits = 8;
-        int pixel = DCAM_PIXELTYPE_MONO8;
+        int bits = bitsCombo->currentText().toInt();
+        int pixel = (bits > 8) ? DCAM_PIXELTYPE_MONO16 : DCAM_PIXELTYPE_MONO8;
         double exp_ms = exposureSpin->value();
         double exp_s = exp_ms / 1000.0;
         int readout = readoutCombo->currentData().toInt();
@@ -426,12 +543,15 @@ int main(int argc, char *argv[]) {
             // Force default exposure to 10 ms on camera and UI
             dcamprop_setvalue(controller.handle(), DCAM_IDPROP_EXPOSURETIME, 0.010);
             exposureSpin->setValue(10.0);
+            // Apply selected bits/pixel type on init
+            int bits = bitsCombo->currentText().toInt();
+            int pixel = (bits > 8) ? DCAM_PIXELTYPE_MONO16 : DCAM_PIXELTYPE_MONO8;
+            dcamprop_setvalue(controller.handle(), DCAM_IDPROP_IMAGE_PIXELTYPE, pixel);
+            dcamprop_setvalue(controller.handle(), DCAM_IDPROP_BITSPERCHANNEL, bits);
             logLine("Init success");
             return true;
         }
     };
-
-    QObject::connect(initBtn, &QPushButton::clicked, doInit);
 
     QObject::connect(reconnectBtn, &QPushButton::clicked, [&](){
         QString err = controller.reconnect();
@@ -443,6 +563,12 @@ int main(int argc, char *argv[]) {
     });
 
     QObject::connect(startBtn, &QPushButton::clicked, [&](){
+        if (controller.isOpened()) {
+            int bits = bitsCombo->currentText().toInt();
+            int pixel = (bits > 8) ? DCAM_PIXELTYPE_MONO16 : DCAM_PIXELTYPE_MONO8;
+            dcamprop_setvalue(controller.handle(), DCAM_IDPROP_IMAGE_PIXELTYPE, pixel);
+            dcamprop_setvalue(controller.handle(), DCAM_IDPROP_BITSPERCHANNEL, bits);
+        }
         QString err = controller.start();
         if (!err.isEmpty()) statusLabel->setText("Start error: " + err);
         else {
@@ -465,6 +591,7 @@ int main(int argc, char *argv[]) {
     std::atomic<bool> recording{false};
     std::atomic<bool> saving{false};
     QElapsedTimer recordTimer;
+    QDateTime recordStartTime;
     std::atomic<int> recordedFrames{0};
     QTimer saveInfoTimer;
     saveInfoTimer.setInterval(200);
@@ -472,6 +599,31 @@ int main(int argc, char *argv[]) {
     QObject::connect(saveBrowseBtn, &QPushButton::clicked, [&](){
         QString dir = QFileDialog::getExistingDirectory(&window, "Select save directory", savePathEdit->text());
         if (!dir.isEmpty()) savePathEdit->setText(dir);
+    });
+    QObject::connect(saveOpenBtn, &QPushButton::clicked, [&](){
+        QString dir = savePathEdit->text();
+        if (dir.isEmpty()) dir = QCoreApplication::applicationDirPath();
+        QDir().mkpath(dir);
+        QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+    });
+
+    QObject::connect(captureBtn, &QPushButton::clicked, [&](){
+        if (lastFrame.isNull()) {
+            statusLabel->setText("No frame to capture");
+            return;
+        }
+        QString baseDir = savePathEdit->text();
+        if (baseDir.isEmpty()) baseDir = QCoreApplication::applicationDirPath();
+        QDir dir(baseDir);
+        dir.mkpath(".");
+        QString fname = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz") + ".tiff";
+        QString outPath = dir.filePath(fname);
+        if (lastFrame.save(outPath, "TIFF")) {
+            statusLabel->setText("Captured: " + fname);
+            logLine("Captured frame to " + outPath);
+        } else {
+            statusLabel->setText("Capture failed");
+        }
     });
 
     auto startSaving = [&](){
@@ -486,6 +638,7 @@ int main(int argc, char *argv[]) {
         }
         recordedFrames = 0;
         recordTimer.restart();
+        recordStartTime = QDateTime::currentDateTime();
         saveStartBtn->setEnabled(false);
         saveStopBtn->setEnabled(true);
         logLine("Recording started");
@@ -540,7 +693,11 @@ int main(int argc, char *argv[]) {
         savingProgress->setValue(0);
         savingDialog->show();
 
-        std::thread([frames, outDir, logLine, statusLabel, savingDialog, savingProgress, totalFrames, &saving](){
+        FrameMeta metaCopy = lastMeta;
+        double expMsCopy = exposureSpin->value();
+        QString recordStartStr = recordStartTime.toString("yyyy-MM-dd hh:mm:ss.zzz");
+
+        std::thread([frames, outDir, logLine, statusLabel, savingDialog, savingProgress, totalFrames, metaCopy, expMsCopy, recordStartStr, &saving](){
             int width = std::max(6, static_cast<int>(std::ceil(std::log10(std::max<size_t>(1, frames->size())))));
             for (size_t i = 0; i < frames->size(); ++i) {
                 const QImage& im = frames->at(i);
@@ -553,6 +710,21 @@ int main(int argc, char *argv[]) {
                         savingProgress->setValue(v);
                     }, Qt::QueuedConnection);
                 }
+            }
+            // Write metadata file
+            QFile infoFile(outDir + "/capture_info.txt");
+            if (infoFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream ts(&infoFile);
+                ts << "Start: " << recordStartStr << "\n";
+                ts << "Frames: " << frames->size() << "\n";
+                ts << "Resolution: " << metaCopy.width << " x " << metaCopy.height << "\n";
+                ts << "Binning: " << metaCopy.binning << "\n";
+                ts << "Bits: " << metaCopy.bits << "\n";
+                ts << "Exposure(ms): " << expMsCopy << "\n";
+                ts << "Internal FPS: " << metaCopy.internalFps << "\n";
+                ts << "Readout speed: " << metaCopy.readoutSpeed << "\n";
+                ts.flush();
+                infoFile.close();
             }
             logLine(QString("Saved %1 frames to %2").arg(frames->size()).arg(outDir));
             QMetaObject::invokeMethod(statusLabel, [statusLabel](){
@@ -587,7 +759,9 @@ int main(int argc, char *argv[]) {
     QObject::connect(&grabber, &FrameGrabber::frameReady, [&](const QImage& img, FrameMeta meta, double fps){
         if (!img.isNull()) {
         imageView->setImage(img);
+        lastFrame = img;
         }
+        lastMeta = meta;
         statsLabel->setText(QString("Resolution: %1 x %2\nBinning: %3\nBits: %4\nFPS: %5 (Cam: %6)\nFrame: %7\nDelivered: %8 Dropped: %9\nReadout: %10")
             .arg(meta.width).arg(meta.height).arg(meta.binning,0,'f',1).arg(meta.bits)
             .arg(fps,0,'f',1).arg(meta.internalFps,0,'f',1).arg(meta.frameIndex).arg(meta.delivered).arg(meta.dropped).arg(meta.readoutSpeed,0,'f',0));
