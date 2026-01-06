@@ -1,0 +1,36 @@
+# Build artifacts
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/compile_commands.json
+
+# Qt / QtCreator
+*_autogen/
+*.pro.user
+*.qrc.depends
+*.qmlc
+*.jsc
+
+# Visual Studio
+/.vs/
+/*.sln
+/*.vcxproj
+/*.vcxproj.filters
+/*.vcxproj.user
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.ipch
+*.pdb
+*.obj
+*.tlog
+
+# Platform build dirs
+/Debug/
+/Release/
+/x64/
+/Win32/
