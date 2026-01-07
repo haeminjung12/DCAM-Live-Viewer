@@ -183,6 +183,270 @@ private:
     std::function<void(double)> onZoomChanged;
 };
 
+static QString formatTimeSeconds(double seconds) {
+    if (seconds < 0) seconds = 0;
+    int totalMs = static_cast<int>(std::lround(seconds * 1000.0));
+    int ms = totalMs % 1000;
+    int totalSec = totalMs / 1000;
+    int s = totalSec % 60;
+    int totalMin = totalSec / 60;
+    int m = totalMin % 60;
+    int h = totalMin / 60;
+    if (h > 0) {
+        return QString("%1:%2:%3.%4")
+            .arg(h,2,10,QChar('0'))
+            .arg(m,2,10,QChar('0'))
+            .arg(s,2,10,QChar('0'))
+            .arg(ms,3,10,QChar('0'));
+    }
+    return QString("%1:%2.%3")
+        .arg(m,2,10,QChar('0'))
+        .arg(s,2,10,QChar('0'))
+        .arg(ms,3,10,QChar('0'));
+}
+
+class ViewerWindow : public QWidget {
+public:
+    ViewerWindow(QWidget* parent=nullptr)
+        : QWidget(parent), fps(0.0) {
+        setWindowFlags(Qt::Window);
+        setWindowTitle("Capture Viewer");
+        resize(1100, 800);
+        setMinimumSize(800, 600);
+
+        imageView = new ZoomImageView;
+        imageView->setMinimumSize(640, 480);
+        imageView->setStyleSheet("background:#000;");
+        imageView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+        frameLabel = new QLabel("Frame: -- / --");
+        timeLabel = new QLabel("Time: -- / --");
+        frameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+        timeLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+
+        folderEdit = new QLineEdit;
+        folderEdit->setPlaceholderText("Select capture folder...");
+        auto browseBtn = new QPushButton("...");
+        auto loadBtn = new QPushButton("Load");
+        recentCombo = new QComboBox;
+        recentCombo->setMinimumWidth(200);
+
+        slider = new QSlider(Qt::Horizontal);
+        slider->setRange(0, 0);
+        slider->setEnabled(false);
+
+        prevBtn = new QPushButton("<");
+        nextBtn = new QPushButton(">");
+        prevBtn->setEnabled(false);
+        nextBtn->setEnabled(false);
+
+        auto folderRow = new QHBoxLayout;
+        folderRow->addWidget(new QLabel("Folder"));
+        folderRow->addWidget(folderEdit, 1);
+        folderRow->addWidget(browseBtn);
+        folderRow->addWidget(loadBtn);
+
+        auto recentRow = new QHBoxLayout;
+        recentRow->addWidget(new QLabel("Recent"));
+        recentRow->addWidget(recentCombo, 1);
+
+        auto navRow = new QHBoxLayout;
+        navRow->addWidget(prevBtn);
+        navRow->addWidget(nextBtn);
+        navRow->addWidget(frameLabel, 1);
+
+        auto infoCol = new QVBoxLayout;
+        infoCol->addLayout(folderRow);
+        infoCol->addLayout(recentRow);
+        infoCol->addWidget(timeLabel);
+        infoCol->addLayout(navRow);
+        infoCol->addWidget(slider);
+        infoCol->addStretch(1);
+
+        auto rightPane = new QWidget;
+        rightPane->setLayout(infoCol);
+        rightPane->setMinimumWidth(320);
+
+        auto layout = new QHBoxLayout;
+        layout->addWidget(imageView, 3);
+        layout->addWidget(rightPane, 1);
+        setLayout(layout);
+
+        imageView->setZoomChanged(nullptr);
+
+        QObject::connect(browseBtn, &QPushButton::clicked, [this](){
+            QString dir = QFileDialog::getExistingDirectory(this, "Select capture folder", folderEdit->text());
+            if (!dir.isEmpty()) folderEdit->setText(dir);
+        });
+        QObject::connect(loadBtn, &QPushButton::clicked, [this](){
+            loadFolder(folderEdit->text());
+        });
+        QObject::connect(recentCombo, &QComboBox::activated, [this](int idx){
+            if (idx < 0) return;
+            QString dir = recentCombo->itemText(idx);
+            if (!dir.isEmpty()) {
+                folderEdit->setText(dir);
+                loadFolder(dir);
+            }
+        });
+        QObject::connect(slider, &QSlider::valueChanged, [this](int v){
+            loadFrame(v);
+        });
+        QObject::connect(prevBtn, &QPushButton::clicked, [this](){
+            if (frameFiles.isEmpty()) return;
+            int v = std::max(0, slider->value() - 1);
+            slider->setValue(v);
+        });
+        QObject::connect(nextBtn, &QPushButton::clicked, [this](){
+            if (frameFiles.isEmpty()) return;
+            int v = std::min(slider->maximum(), slider->value() + 1);
+            slider->setValue(v);
+        });
+
+        auto leftShortcut = new QShortcut(QKeySequence(Qt::Key_Left), this);
+        auto rightShortcut = new QShortcut(QKeySequence(Qt::Key_Right), this);
+        auto ctrlLeftShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Left), this);
+        auto ctrlRightShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Right), this);
+        auto pageUpShortcut = new QShortcut(QKeySequence(Qt::Key_PageUp), this);
+        auto pageDownShortcut = new QShortcut(QKeySequence(Qt::Key_PageDown), this);
+        QObject::connect(leftShortcut, &QShortcut::activated, [this](){
+            stepFrames(-1);
+        });
+        QObject::connect(rightShortcut, &QShortcut::activated, [this](){
+            stepFrames(1);
+        });
+        QObject::connect(ctrlLeftShortcut, &QShortcut::activated, [this](){
+            stepFrames(-5);
+        });
+        QObject::connect(ctrlRightShortcut, &QShortcut::activated, [this](){
+            stepFrames(5);
+        });
+        QObject::connect(pageUpShortcut, &QShortcut::activated, [this](){
+            stepFrames(-10);
+        });
+        QObject::connect(pageDownShortcut, &QShortcut::activated, [this](){
+            stepFrames(10);
+        });
+
+        loadRecentFolders();
+    }
+
+private:
+    void stepFrames(int delta) {
+        if (frameFiles.isEmpty()) return;
+        int v = std::clamp(slider->value() + delta, 0, slider->maximum());
+        slider->setValue(v);
+    }
+
+    void loadRecentFolders() {
+        QSettings settings;
+        QStringList recent = settings.value("viewer/recentFolders").toStringList();
+        recentCombo->clear();
+        for (const QString& path : recent) {
+            recentCombo->addItem(path);
+        }
+    }
+
+    void updateRecentFolders(const QString& dirPath) {
+        QSettings settings;
+        QStringList recent = settings.value("viewer/recentFolders").toStringList();
+        recent.removeAll(dirPath);
+        recent.prepend(dirPath);
+        while (recent.size() > 10) recent.removeLast();
+        settings.setValue("viewer/recentFolders", recent);
+        recentCombo->clear();
+        for (const QString& path : recent) {
+            recentCombo->addItem(path);
+        }
+    }
+
+    void loadFolder(const QString& dirPath) {
+        QDir dir(dirPath);
+        if (!dir.exists()) {
+            QMessageBox::warning(this, "Folder not found", "The selected folder does not exist.");
+            return;
+        }
+        QStringList filters;
+        filters << "*.tif" << "*.tiff" << "*.TIF" << "*.TIFF";
+        frameFiles = dir.entryList(filters, QDir::Files, QDir::Name);
+        for (QString& f : frameFiles) {
+            f = dir.absoluteFilePath(f);
+        }
+        fps = readFpsFromInfo(dir.absoluteFilePath("capture_info.txt"));
+        slider->setEnabled(!frameFiles.isEmpty());
+        prevBtn->setEnabled(!frameFiles.isEmpty());
+        nextBtn->setEnabled(!frameFiles.isEmpty());
+        int count = static_cast<int>(frameFiles.size());
+        slider->setRange(0, std::max(0, count - 1));
+        slider->setValue(0);
+        updateTimeLabel(0);
+        if (frameFiles.isEmpty()) {
+            frameLabel->setText("Frame: -- / --");
+        } else {
+            frameLabel->setText(QString("Frame: %1 / %2").arg(1).arg(count));
+            updateRecentFolders(dir.absolutePath());
+        }
+    }
+
+    double readFpsFromInfo(const QString& infoPath) const {
+        QFile f(infoPath);
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return 0.0;
+        QTextStream ts(&f);
+        double foundFps = 0.0;
+        while (!ts.atEnd()) {
+            QString line = ts.readLine().trimmed();
+            if (line.startsWith("Internal FPS:", Qt::CaseInsensitive) ||
+                line.startsWith("FPS:", Qt::CaseInsensitive)) {
+                QStringList parts = line.split(":");
+                if (parts.size() >= 2) {
+                    bool ok = false;
+                    double val = parts.last().trimmed().toDouble(&ok);
+                    if (ok) foundFps = val;
+                }
+            }
+        }
+        return foundFps;
+    }
+
+    void loadFrame(int index) {
+        if (frameFiles.isEmpty()) return;
+        int count = static_cast<int>(frameFiles.size());
+        index = std::clamp(index, 0, count - 1);
+        QImageReader reader(frameFiles.at(index));
+        reader.setAutoTransform(true);
+        QImage img = reader.read();
+        if (img.isNull()) {
+            QMessageBox::warning(this, "Read error", "Failed to load image:\n" + reader.errorString());
+            return;
+        }
+        imageView->setImage(img);
+        frameLabel->setText(QString("Frame: %1 / %2").arg(index + 1).arg(count));
+        updateTimeLabel(index);
+    }
+
+    void updateTimeLabel(int index) {
+        int count = static_cast<int>(frameFiles.size());
+        if (fps <= 0.0 || count == 0) {
+            timeLabel->setText("Time: -- / --");
+            return;
+        }
+        double totalSec = static_cast<double>(count) / fps;
+        double currentSec = static_cast<double>(index) / fps;
+        timeLabel->setText(QString("Time: %1 / %2").arg(formatTimeSeconds(currentSec)).arg(formatTimeSeconds(totalSec)));
+    }
+
+    ZoomImageView* imageView;
+    QLabel* frameLabel;
+    QLabel* timeLabel;
+    QLineEdit* folderEdit;
+    QComboBox* recentCombo;
+    QSlider* slider;
+    QPushButton* prevBtn;
+    QPushButton* nextBtn;
+    QStringList frameFiles;
+    double fps;
+};
+
 void pruneLogs() {
     QFileInfo fi(gLogFile);
     QString baseDir = fi.dir().absolutePath();
@@ -236,6 +500,8 @@ void installLogTees() {
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
+    QCoreApplication::setOrganizationName("Hamamatsu");
+    QCoreApplication::setApplicationName("qt_hama_gui");
 
     gLogPath = QCoreApplication::applicationDirPath() + "/session_log.txt";
     gLogFile.setFileName(gLogPath);
@@ -265,14 +531,12 @@ int main(int argc, char *argv[]) {
     statsLabel->setTextFormat(Qt::PlainText);
     statsLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     statsLabel->setMinimumWidth(220);
-    auto zoomLabel = new QLabel("Zoom: x1.00");
-    zoomLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-
     // Buttons
     auto startBtn = new QPushButton("Start");
     auto stopBtn = new QPushButton("Stop");
     auto reconnectBtn = new QPushButton("Reconnect");
     auto applyBtn = new QPushButton("Apply Settings");
+    auto viewerBtn = new QPushButton("Viewer");
     auto tabWidget = new QTabWidget;
 
     // Settings controls
@@ -363,7 +627,6 @@ int main(int argc, char *argv[]) {
 
     auto controlLayout = new QVBoxLayout;
     controlLayout->addWidget(statusLabel);
-    controlLayout->addWidget(zoomLabel);
     controlLayout->addWidget(statsLabel);
 
     auto tabFormats = new QWidget;
@@ -415,6 +678,7 @@ int main(int argc, char *argv[]) {
     btnRow->addWidget(reconnectBtn);
 
     controlLayout->addWidget(tabWidget);
+    controlLayout->addWidget(viewerBtn);
     controlLayout->addLayout(btnRow);
     controlLayout->addWidget(applyBtn);
     controlLayout->addStretch(1);
@@ -434,14 +698,13 @@ int main(int argc, char *argv[]) {
         logMessage(msg);
     };
 
-    imageView->setZoomChanged([zoomLabel](double z){
-        zoomLabel->setText(QString("Zoom: x%1").arg(z,0,'f',2));
-    });
+    imageView->setZoomChanged(nullptr);
 
     DcamController controller(&window);
     FrameGrabber grabber(&controller);
     QImage lastFrame;
     FrameMeta lastMeta{};
+    bool viewerOnly = false;
 
     auto refreshExposureLimits = [&](){
         if (!controller.isOpened()) return;
@@ -530,11 +793,31 @@ int main(int argc, char *argv[]) {
         logReadback();
     };
 
+    auto setViewerOnly = [&](){
+        viewerOnly = true;
+        statusLabel->setText("Viewer-only mode (camera init failed).");
+        startBtn->setEnabled(false);
+        stopBtn->setEnabled(false);
+        reconnectBtn->setEnabled(false);
+        applyBtn->setEnabled(false);
+        tabWidget->setEnabled(false);
+    };
+
     auto doInit = [&]()->bool{
         QString err = controller.initAndOpen();
         if (!err.isEmpty()) {
             statusLabel->setText("Init error: " + err);
-            QMessageBox::critical(&window, "Init failed", "Camera init failed:\n" + err);
+            auto choice = QMessageBox::question(
+                &window,
+                "Init failed",
+                "Camera init failed:\n" + err + "\n\nLaunch viewer-only mode?",
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::Yes);
+            if (choice == QMessageBox::Yes) {
+                logLine("Init failed; switching to viewer-only mode.");
+                setViewerOnly();
+                return false;
+            }
             QMetaObject::invokeMethod(&app, "quit", Qt::QueuedConnection);
             return false;
         } else {
@@ -563,6 +846,7 @@ int main(int argc, char *argv[]) {
     });
 
     QObject::connect(startBtn, &QPushButton::clicked, [&](){
+        if (viewerOnly) return;
         if (controller.isOpened()) {
             int bits = bitsCombo->currentText().toInt();
             int pixel = (bits > 8) ? DCAM_PIXELTYPE_MONO16 : DCAM_PIXELTYPE_MONO8;
@@ -578,12 +862,29 @@ int main(int argc, char *argv[]) {
     });
 
     QObject::connect(stopBtn, &QPushButton::clicked, [&](){
+        if (viewerOnly) return;
         grabber.stopGrabbing();
         controller.stop();
         statusLabel->setText("Capture stopped.");
     });
 
-    QObject::connect(applyBtn, &QPushButton::clicked, applySettings);
+    QObject::connect(applyBtn, &QPushButton::clicked, [&](){
+        if (viewerOnly) return;
+        applySettings();
+    });
+
+    QPointer<ViewerWindow> viewerWindow;
+    QObject::connect(viewerBtn, &QPushButton::clicked, [&](){
+        if (viewerWindow) {
+            viewerWindow->raise();
+            viewerWindow->activateWindow();
+            return;
+        }
+        viewerWindow = new ViewerWindow(nullptr);
+        viewerWindow->setAttribute(Qt::WA_DeleteOnClose);
+        QObject::connect(viewerWindow, &QObject::destroyed, [&](){ viewerWindow = nullptr; });
+        viewerWindow->show();
+    });
 
     // Save state
     auto saveBuffer = std::make_shared<std::vector<QImage>>();
